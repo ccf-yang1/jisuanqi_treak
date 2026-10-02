@@ -1,0 +1,8 @@
+Package: com.ccifang.appmaskcalc
+Name: AppMaskCalc
+Version: 1.0.0
+Architecture: iphoneos-arm
+Description: Universal calculator disguise lock. Zero-dependency dylib for TrollFools per-app injection.
+Maintainer: ccf-yang1
+Author: ccf-yang1 (based on telegram-mask by iOS宝藏)
+Section: Utilities

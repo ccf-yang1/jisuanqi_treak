@@ -1,0 +1,52 @@
+name: Build
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install ldid
+        run: |
+          curl -sLO https://github.com/ProcursusTeam/ldid/releases/latest/download/ldid_linux_x86_64
+          chmod +x ldid_linux_x86_64
+          sudo mv ldid_linux_x86_64 /usr/local/bin/ldid
+
+      - name: Install Theos
+        run: |
+          git clone --depth 1 https://github.com/theos/theos.git "$GITHUB_WORKSPACE/theos"
+          curl -sL https://github.com/theos/sdks/archive/refs/heads/master.zip -o /tmp/sdks.zip
+          unzip -q /tmp/sdks.zip -d /tmp/sdks-extract
+          mkdir -p "$GITHUB_WORKSPACE/theos/sdks"
+          mv /tmp/sdks-extract/*/* "$GITHUB_WORKSPACE/theos/sdks/"
+
+      - name: Build
+        run: |
+          export THEOS="$GITHUB_WORKSPACE/theos"
+          make FINALPACKAGE=1
+          DYLIB=$(find .theos -name '*.dylib' | head -n1)
+          cp "$DYLIB" AppMaskCalc.dylib
+          file AppMaskCalc.dylib
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AppMaskCalc.dylib
+          path: AppMaskCalc.dylib
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "build-${{ github.run_number }}" AppMaskCalc.dylib \
+            --title "AppMaskCalc build-${{ github.run_number }}" \
+            --notes "TrollFools 注入用 dylib（零依赖）。下载后用 TrollFools 选择该 dylib 注入目标 app 即可。"
