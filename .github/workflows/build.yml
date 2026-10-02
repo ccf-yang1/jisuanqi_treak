@@ -10,31 +10,18 @@ permissions:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: macos-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install ldid
+      - name: Build AppMaskCalc.dylib
         run: |
-          curl -sLO https://github.com/ProcursusTeam/ldid/releases/latest/download/ldid_linux_x86_64
-          chmod +x ldid_linux_x86_64
-          sudo mv ldid_linux_x86_64 /usr/local/bin/ldid
-
-      - name: Install Theos
-        run: |
-          git clone --recursive --depth 1 --shallow-submodules --jobs 4 https://github.com/theos/theos.git "$GITHUB_WORKSPACE/theos"
-          curl -sL https://github.com/theos/sdks/archive/refs/heads/master.zip -o /tmp/sdks.zip
-          unzip -q /tmp/sdks.zip -d /tmp/sdks-extract
-          mkdir -p "$GITHUB_WORKSPACE/theos/sdks"
-          mv /tmp/sdks-extract/*/* "$GITHUB_WORKSPACE/theos/sdks/"
-
-      - name: Build
-        run: |
-          export THEOS="$GITHUB_WORKSPACE/theos"
-          make FINALPACKAGE=1
-          DYLIB=$(find .theos -name '*.dylib' | head -n1)
-          cp "$DYLIB" AppMaskCalc.dylib
+          xcrun -sdk iphoneos clang -arch arm64 -fobjc-arc \
+            -dynamiclib -framework UIKit -framework Foundation \
+            -miphoneos-version-min=14.0 \
+            -x objective-c Tweak.x -o AppMaskCalc.dylib
+          codesign --force --sign - AppMaskCalc.dylib
           file AppMaskCalc.dylib
 
       - name: Upload artifact
