@@ -6,7 +6,7 @@
 //   默认密码 = 当前时间 HHmm（24 小时制，如 14:30 → 1430）
 //   三指双击 → 可设置自定义密码（存于本 app 沙箱 NSUserDefaults，每个 app 独立）
 //
-// 构建：Theos (library.mk)，产物 .theos/obj/*.dylib
+// 构建：macOS 上 `xcrun -sdk iphoneos clang` 直接编译（见 .github/workflows/build.yml）
 
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
@@ -16,7 +16,14 @@
 
 static NSString * const kCustomPasswordKey = @"customPassword";
 
-@class CalculatorViewController;
+@interface CalculatorViewController : UIViewController
+@property (nonatomic, strong) UILabel *displayLabel;
+@property (nonatomic, strong) UILabel *historyLabel;
+@property (nonatomic, strong) NSMutableString *currentExpression;
+@property (nonatomic, strong) NSMutableString *history;
+@property (nonatomic, strong) NSString *customPassword;
+@property (nonatomic, assign) BOOL isCustomPasswordEnabled;
+@end
 
 static UIWindow *maskWindow = nil;
 
@@ -52,15 +59,6 @@ static void ShowMaskIfNeeded(void) {
 }
 
 #pragma mark - Calculator UI
-
-@interface CalculatorViewController : UIViewController
-@property (nonatomic, strong) UILabel *displayLabel;
-@property (nonatomic, strong) UILabel *historyLabel;
-@property (nonatomic, strong) NSMutableString *currentExpression;
-@property (nonatomic, strong) NSMutableString *history;
-@property (nonatomic, strong) NSString *customPassword;
-@property (nonatomic, assign) BOOL isCustomPasswordEnabled;
-@end
 
 @implementation CalculatorViewController
 
