@@ -26,7 +26,7 @@ jobs:
           git clone --depth 1 https://github.com/theos/theos.git "$GITHUB_WORKSPACE/theos"
           curl -sL https://github.com/theos/sdks/archive/refs/heads/master.zip -o /tmp/sdks.zip
           unzip -q /tmp/sdks.zip -d /tmp/sdks-extract
-          mkdir -p "$GITHUB_WORKSPACE/theos/sdks"
+          mkdir -p "$GITHUB_WORKSPACE/theos/sdks" "$GITHUB_WORKSPACE/theos/vendor/include" "$GITHUB_WORKSPACE/theos/vendor/lib"
           mv /tmp/sdks-extract/*/* "$GITHUB_WORKSPACE/theos/sdks/"
 
       - name: Build
