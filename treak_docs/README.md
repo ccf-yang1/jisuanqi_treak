@@ -110,3 +110,44 @@ macOS 自带 Xcode iOS SDK 与 clang，Theos 在 macOS 上工作正常。产物�
 - 行为开关：`Tweak.x` 顶部 `RELOCK_ON_FOREGROUND`（1 = 回前台重新上锁，0 = 仅冷启动上锁）
 - 构建产物：AppMaskCalc.dylib（arm64，min iOS 14.0，ad-hoc 签名）
 - Release 命名规则：`build-<run_number>`，每次 push main 自动构建并发布
+
+## 7. 免锁时长、设置页与链接 App（v1.1 新增）
+
+### 7.1 后台免锁时长
+
+`UIApplicationWillEnterForeground` 时不再无条件上锁，而是比较「离开时刻」与当前时间的间隔：
+
+- 间隔 ≤ 免锁时长（默认 10 分钟）且本次已解锁 → 直接进入，不弹计算器
+- 间隔超过阈值 → 重新上锁
+
+关键符号：`CanSkipLock()` 统一决策、`PersistUnlocked()` / `PersistBackgroundTime()` 负责持久化、`GracePeriodMinutes()` 读取配置。免锁时长存于 `NSUserDefaults` 的 `com.ccifang.appmaskcalc.gracePeriodMinutes`，`0` 表示每次回前台都重新上锁（等价旧行为）。
+
+状态跨进程持久化的原因：iOS 可能在后台回收 app 进程，若只把「已解锁」放在内存变量里，10 分钟内被系统杀进程后再进来会被误锁。因此同时持久化 `unlocked`、`unlockedAt`、`lastBackgroundAt` 三个键。冷启动若没有 `lastBackgroundAt`，用 `unlockedAt` 兜底，避免强杀后永久免锁。
+
+注意：若用户从未解锁过（`unlocked == NO`），从后台回来仍会上锁。
+
+### 7.2 设置页（9999）
+
+在计算器输入 `9999` 打开设置页，可修改免锁时长、增删链接 App。设置页是可关闭的 modal，不依赖宿主 app 的任何控制器。
+
+### 7.3 链接 App（8888）
+
+输入 `8888` 会先解锁当前 app，再跳转到配置的目标 app。目标支持：
+
+- 完整 URL：`twitter://messages`
+- URL scheme：`twitter://`
+- bundle id：`com.tencent.xin`（走私有 `LSApplicationWorkspace openApplicationWithBundleID:`，需要 `dlopen` 私有 framework）
+
+配置了多个目标时弹出选择列表，只有一个时直接跳转。跳转权限依赖宿主 app 的 `LSApplicationQueriesSchemes`；bundle id 方式通常比 URL scheme 更通用。
+
+**限制**：`openApplicationWithBundleID:` 属私有 API，App Store 审核会拒绝；TrollStore 注入场景可用。部分系统 app 或被系统限制的 app 可能拒绝跳转。
+
+### 7.4 启动瞬间的宿主图标闪过（问题 3）
+
+TrollFools 注入的 dylib 在宿主 app 进程内加载，加载时机晚于系统显示启动图（LaunchScreen/Splash）的阶段，因此 X、Instagram 等应用的图标/启动页会先于计算器出现一小段时间。这属于**系统级启动流程**，dylib 无法完全消除，只能通过提前挂窗口缩短：
+
+- 监听 `UISceneWillConnectNotification`（早于 `didFinishLaunching`），用对应 scene 先创建伪装 window（不抢 key）
+- 监听 `UISceneDidActivateNotification` 再 `makeKeyAndVisible`，确保盖在最前
+- 无法使用 `UIApplicationMain` 替换或 launch 前 hook（TrollFools 不提供该时机，且会破坏宿主）
+
+若希望完全无闪屏，唯一彻底方案是在越狱环境用 Tweak 修改宿主 Info.plist 的启动图，或用 iOS 18 原生 App Lock。注入方案只能做到「尽量早、尽量短」。
