@@ -5,13 +5,13 @@
 // 解锁方式：输入表达式，计算结果等于当前密码即解锁。
 //   默认密码 = 当前时间 HHmm（24 小时制，如 14:30 → 1430）
 //   三指双击 → 可设置自定义密码（存于本 app 沙箱 NSUserDefaults，每个 app 独立）
-//   9999 → 打开设置（免锁时长、链接 App）
+//   0123456789 → 打开设置（免锁时长、链接 App）
 //   8888 → 解锁并跳转到链接 App（本 App 本身仍保持锁定）
 //
 // 免锁规则（v1.2）：
 //   只有「密码解锁」（时间密码 / 自定义密码）才进入免锁状态；
 //   之后切到后台（Home/上划回桌面）再回来，离开时长不超过「后台免锁时长」（默认 10 分钟，可配置）才直接进入。
-//   8888 / 9999 不进入免锁状态 —— 每次回到本 App 仍然重新上锁。
+//   8888 / 0123456789 不进入免锁状态 —— 每次回到本 App 仍然重新上锁。
 //   免锁状态只保存在进程内存里：上划杀掉 App（或进程被系统回收）后重新打开，一律重新上锁。
 //
 // 构建：macOS 上 `xcrun -sdk iphoneos clang` 直接编译（见 .github/workflows/build.yml）
@@ -26,6 +26,10 @@ static NSString * const kGracePeriodKey = @"com.ccifang.appmaskcalc.gracePeriodM
 static NSString * const kLinkedAppsKey = @"com.ccifang.appmaskcalc.linkedApps";
 
 static const NSInteger kDefaultGracePeriodMinutes = 10;
+
+// 保留指令
+static NSString * const kSettingsCode = @"0123456789";
+static NSString * const kLinkedAppCode = @"8888";
 
 static UIWindow *maskWindow = nil;
 // 解锁状态与离开后台时刻只放内存：进程一旦结束（用户上划强杀 / 系统回收），
@@ -92,19 +96,42 @@ static BOOL CanSkipLock(void) {
 
 #pragma mark - Launch Services Helpers
 
+// 不同 iOS 版本里 LSApplicationWorkspace 所在的 framework 路径不一样，
+// 逐个尝试加载（都在 dyld 共享缓存里，dlopen 是安全的）。
+static Class LoadPrivateClass(NSString *className) {
+    Class cls = NSClassFromString(className);
+    if (cls != Nil) return cls;
+
+    static const char *paths[] = {
+        "/System/Library/PrivateFrameworks/MobileCoreServices.framework/MobileCoreServices",
+        "/System/Library/PrivateFrameworks/CoreServices.framework/CoreServices",
+        "/System/Library/Frameworks/CoreServices.framework/CoreServices",
+        "/System/Library/PrivateFrameworks/LaunchServices.framework/LaunchServices",
+        "/System/Library/Frameworks/LaunchServices.framework/LaunchServices",
+    };
+    size_t count = sizeof(paths) / sizeof(paths[0]);
+    for (size_t i = 0; i < count; i++) {
+        dlopen(paths[i], RTLD_LAZY);
+        cls = NSClassFromString(className);
+        if (cls != Nil) return cls;
+    }
+    return Nil;
+}
+
 static Class LSApplicationWorkspaceClass(void) {
     static Class cls = Nil;
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
-        cls = NSClassFromString(@"LSApplicationWorkspace");
-        if (cls == Nil) {
-            dlopen("/System/Library/PrivateFrameworks/MobileCoreServices.framework/MobileCoreServices", RTLD_LAZY);
-            cls = NSClassFromString(@"LSApplicationWorkspace");
-        }
-        if (cls == Nil) {
-            dlopen("/System/Library/PrivateFrameworks/CoreServices.framework/CoreServices", RTLD_LAZY);
-            cls = NSClassFromString(@"LSApplicationWorkspace");
-        }
+        cls = LoadPrivateClass(@"LSApplicationWorkspace");
+    });
+    return cls;
+}
+
+static Class LSApplicationProxyClass(void) {
+    static Class cls = Nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        cls = LoadPrivateClass(@"LSApplicationProxy");
     });
     return cls;
 }
@@ -114,6 +141,36 @@ static id LSDefaultWorkspace(void) {
     SEL sel = NSSelectorFromString(@"defaultWorkspace");
     if (cls == Nil || ![cls respondsToSelector:sel]) return nil;
     return ((id (*)(id, SEL))objc_msgSend)(cls, sel);
+}
+
+static id LSProxyForBundleID(NSString *bundleID) {
+    Class proxyClass = LSApplicationProxyClass();
+    SEL sel = NSSelectorFromString(@"applicationProxyForIdentifier:");
+    if (proxyClass == Nil || ![proxyClass respondsToSelector:sel]) return nil;
+    return ((id (*)(id, SEL, id))objc_msgSend)(proxyClass, sel, bundleID);
+}
+
+static NSString *ProxyStringValue(id proxy, NSString *key) {
+    if (proxy == nil) return nil;
+
+    id value = nil;
+    @try { value = [proxy valueForKey:key]; } @catch (NSException *exception) { (void)exception; }
+
+    // 个别系统上 KVC 会抛异常，退回直接发消息再取一次
+    if (![value isKindOfClass:[NSString class]]) {
+        SEL sel = NSSelectorFromString(key);
+        if ([proxy respondsToSelector:sel]) {
+            @try { value = ((id (*)(id, SEL))objc_msgSend)(proxy, sel); } @catch (NSException *exception) { (void)exception; }
+        }
+    }
+    return [value isKindOfClass:[NSString class]] ? (NSString *)value : nil;
+}
+
+static NSString *ProxyDisplayName(id proxy) {
+    NSString *name = ProxyStringValue(proxy, @"localizedName");
+    if (name.length == 0) name = ProxyStringValue(proxy, @"displayName");
+    if (name.length == 0) name = ProxyStringValue(proxy, @"itemName");
+    return name.length > 0 ? name : nil;
 }
 
 // 支持三种写法：完整 URL（twitter://...）、URL scheme（twitter://）、bundle id（com.xx.xx）
@@ -127,31 +184,10 @@ static BOOL IsBundleIdentifier(NSString *text) {
     return [regex firstMatchInString:text options:0 range:range] != nil;
 }
 
-static Class LSApplicationProxyClass(void) {
-    static Class cls = Nil;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        cls = NSClassFromString(@"LSApplicationProxy");
-        if (cls == Nil) {
-            dlopen("/System/Library/PrivateFrameworks/MobileCoreServices.framework/MobileCoreServices", RTLD_LAZY);
-            cls = NSClassFromString(@"LSApplicationProxy");
-        }
-        if (cls == Nil) {
-            dlopen("/System/Library/PrivateFrameworks/CoreServices.framework/CoreServices", RTLD_LAZY);
-            cls = NSClassFromString(@"LSApplicationProxy");
-        }
-    });
-    return cls;
-}
-
 // 兜底：部分环境会限制 openApplicationWithBundleID:，
 // 此时改从 LSApplicationProxy 取该 App 的 URL scheme 再打开
 static BOOL OpenBundleIdentifierViaScheme(NSString *bundleID) {
-    Class proxyClass = LSApplicationProxyClass();
-    SEL proxySel = NSSelectorFromString(@"applicationProxyForIdentifier:");
-    if (proxyClass == Nil || ![proxyClass respondsToSelector:proxySel]) return NO;
-
-    id proxy = ((id (*)(id, SEL, id))objc_msgSend)(proxyClass, proxySel, bundleID);
+    id proxy = LSProxyForBundleID(bundleID);
     if (proxy == nil) return NO;
 
     NSArray *schemes = nil;
@@ -214,47 +250,236 @@ static BOOL OpenTargetApp(NSString *target) {
     return NO;
 }
 
-// 返回已安装 App 列表：[{name, target(bundle id)}]，按名称排序。
-// 使用 Networking/LaunchServices 私有 API，TrollStore 注入场景可用。
-static NSArray<NSDictionary *> *InstalledAppEntries(void) {
-    NSMutableArray<NSDictionary *> *result = [NSMutableArray array];
+#pragma mark - Installed Apps Enumeration
 
+// 上次枚举的原始数量，枚举为空时显示在界面上，便于定位是哪条路被系统拦了
+static NSString *gInstalledAppsDiagnostics = nil;
+
+// 1) LSApplicationWorkspace 枚举。部分注入环境没有 LaunchServices 私有 entitlement，
+//    这一步会返回空，所以后面还有别的兜底来源。
+static NSArray *WorkspaceAppProxies(void) {
     id workspace = LSDefaultWorkspace();
-    if (workspace == nil) return result;
+    if (workspace == nil) return @[];
 
-    // 不同 iOS 版本可用的枚举方法略有差异，按优先级依次尝试
-    NSArray *apps = nil;
-    NSArray<NSString *> *selectors = @[@"allInstalledApplications", @"installedApplications"];
-    for (NSString *selectorName in selectors) {
+    NSArray<NSString *> *selectorNames = @[
+        @"allInstalledApplications",
+        @"installedApplications",
+        @"allApplications"
+    ];
+    for (NSString *selectorName in selectorNames) {
         SEL sel = NSSelectorFromString(selectorName);
         if (![workspace respondsToSelector:sel]) continue;
         id value = ((id (*)(id, SEL))objc_msgSend)(workspace, sel);
         if ([value isKindOfClass:[NSArray class]] && [(NSArray *)value count] > 0) {
-            apps = (NSArray *)value;
-            break;
+            return (NSArray *)value;
+        }
+        if ([value isKindOfClass:[NSSet class]] && [(NSSet *)value count] > 0) {
+            return [(NSSet *)value allObjects];
         }
     }
-    if (apps == nil) return result;
 
+    SEL enumerateSel = NSSelectorFromString(@"enumerateInstalledApplications:");
+    if ([workspace respondsToSelector:enumerateSel]) {
+        NSMutableArray *proxies = [NSMutableArray array];
+        void (^handler)(id, BOOL *) = ^(id proxy, BOOL *stop) {
+            if (proxy != nil) [proxies addObject:proxy];
+        };
+        @try {
+            ((void (*)(id, SEL, id))objc_msgSend)(workspace, enumerateSel, handler);
+        } @catch (NSException *exception) {
+            (void)exception;
+        }
+        if (proxies.count > 0) return proxies;
+    }
+    return @[];
+}
+
+// 2) MobileInstallationLookup：老牌私有 C 接口，返回 {bundleID: info}
+static NSDictionary *MobileInstallationLookupCompat(void) {
+    static void *handle = NULL;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        handle = dlopen("/System/Library/PrivateFrameworks/MobileInstallation.framework/MobileInstallation", RTLD_LAZY);
+    });
+    if (handle == NULL) return nil;
+
+    typedef NSDictionary *(*LookupFunc)(NSDictionary *);
+    LookupFunc lookup = (LookupFunc)dlsym(handle, "MobileInstallationLookup");
+    if (lookup == NULL) return nil;
+
+    NSDictionary *options = @{
+        @"ApplicationType": @"Any",
+        @"ReturnAttributes": @[@"CFBundleIdentifier", @"CFBundleDisplayName", @"CFBundleName"]
+    };
+    id result = nil;
+    @try { result = lookup(options); } @catch (NSException *exception) { (void)exception; }
+    return [result isKindOfClass:[NSDictionary class]] ? (NSDictionary *)result : nil;
+}
+
+// 3) SBSCopyDisplayIdentifiers：只返回 bundle id 列表（拿不到名称，之后用 LSProxy 补）
+static NSArray *SBSDisplayIdentifiers(void) {
+    static void *handle = NULL;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        handle = dlopen("/System/Library/PrivateFrameworks/SpringBoardServices.framework/SpringBoardServices", RTLD_LAZY);
+    });
+    if (handle == NULL) return @[];
+
+    typedef NSArray *(*CopyIdentifiersFunc)(void);
+    CopyIdentifiersFunc copyIdentifiers = (CopyIdentifiersFunc)dlsym(handle, "SBSCopyDisplayIdentifiers");
+    if (copyIdentifiers == NULL) return @[];
+
+    id identifiers = nil;
+    @try { identifiers = copyIdentifiers(); } @catch (NSException *exception) { (void)exception; }
+    if ([identifiers isKindOfClass:[NSArray class]]) return (NSArray *)identifiers;
+    if ([identifiers isKindOfClass:[NSSet class]]) return [(NSSet *)identifiers allObjects];
+    return @[];
+}
+
+// SpringBoard 的本地化名称查询，给只有 bundle id 没有名称的来源补名称
+static NSString *SBSLocalizedNameForBundleID(NSString *bundleID) {
+    if (bundleID.length == 0) return nil;
+
+    static void *handle = NULL;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        handle = dlopen("/System/Library/PrivateFrameworks/SpringBoardServices.framework/SpringBoardServices", RTLD_LAZY);
+    });
+    if (handle == NULL) return nil;
+
+    typedef NSString *(*NameFunc)(NSString *);
+    NameFunc nameFunc = (NameFunc)dlsym(handle, "SBSCopyLocalizedApplicationNameForDisplayIdentifier");
+    if (nameFunc == NULL) return nil;
+
+    id name = nil;
+    @try { name = nameFunc(bundleID); } @catch (NSException *exception) { (void)exception; }
+    return [name isKindOfClass:[NSString class]] ? (NSString *)name : nil;
+}
+
+// 4) 直接扫描 App bundle 目录。普通沙箱会被拒绝（返回 nil），
+//    TrollStore / platform-application 一类的宽松环境可以成功，作为最后兜底。
+static NSDictionary *AppEntryAtBundlePath(NSString *appPath) {
+    NSString *infoPath = [appPath stringByAppendingPathComponent:@"Info.plist"];
+    NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:infoPath];
+    if (![info isKindOfClass:[NSDictionary class]]) return nil;
+
+    NSString *bundleID = info[@"CFBundleIdentifier"];
+    if (![bundleID isKindOfClass:[NSString class]] || bundleID.length == 0) return nil;
+
+    NSString *name = info[@"CFBundleDisplayName"];
+    if (![name isKindOfClass:[NSString class]] || name.length == 0) name = info[@"CFBundleName"];
+    if (![name isKindOfClass:[NSString class]] || name.length == 0) name = bundleID;
+
+    return @{@"name": name, @"target": bundleID};
+}
+
+static NSArray<NSDictionary *> *FilesystemAppEntries(void) {
+    NSMutableArray<NSDictionary *> *result = [NSMutableArray array];
+    NSFileManager *manager = [NSFileManager defaultManager];
+
+    // 用户 App：/private/var/containers/Bundle/Application/<UUID>/<Name>.app
+    NSArray<NSString *> *containerRoots = @[
+        @"/private/var/containers/Bundle/Application",
+        @"/var/containers/Bundle/Application"
+    ];
+    for (NSString *root in containerRoots) {
+        NSArray<NSString *> *uuids = [manager contentsOfDirectoryAtPath:root error:nil];
+        for (NSString *uuid in uuids) {
+            NSString *uuidPath = [root stringByAppendingPathComponent:uuid];
+            NSArray<NSString *> *bundles = [manager contentsOfDirectoryAtPath:uuidPath error:nil];
+            for (NSString *bundle in bundles) {
+                if (![bundle hasSuffix:@".app"]) continue;
+                NSDictionary *entry = AppEntryAtBundlePath([uuidPath stringByAppendingPathComponent:bundle]);
+                if (entry != nil) [result addObject:entry];
+            }
+        }
+    }
+
+    // 系统 App：/Applications/<Name>.app
+    NSArray<NSString *> *systemBundles = [manager contentsOfDirectoryAtPath:@"/Applications" error:nil];
+    for (NSString *bundle in systemBundles) {
+        if (![bundle hasSuffix:@".app"]) continue;
+        NSDictionary *entry = AppEntryAtBundlePath([@"/Applications" stringByAppendingPathComponent:bundle]);
+        if (entry != nil) [result addObject:entry];
+    }
+
+    return result;
+}
+
+// 汇总多个来源，按 bundle id 去重，返回 [{name, target(bundle id)}]
+static NSArray<NSDictionary *> *InstalledAppEntries(void) {
+    NSMutableArray<NSDictionary *> *result = [NSMutableArray array];
+    NSMutableSet<NSString *> *seen = [NSMutableSet set];
     NSString *selfBundleID = [[NSBundle mainBundle] bundleIdentifier];
 
-    for (id app in apps) {
-        NSString *bundleID = nil;
-        NSString *name = nil;
+    void (^addEntry)(NSString *, NSString *) = ^(NSString *bundleID, NSString *name) {
+        if (![bundleID isKindOfClass:[NSString class]] || bundleID.length == 0) return;
+        if (selfBundleID != nil && [bundleID isEqualToString:selfBundleID]) return;
+        if ([seen containsObject:bundleID]) return;
+        [seen addObject:bundleID];
 
-        @try { bundleID = [app valueForKey:@"bundleIdentifier"]; } @catch (NSException *exception) { (void)exception; }
-        if (![bundleID isKindOfClass:[NSString class]] || bundleID.length == 0) continue;
-
-        @try { name = [app valueForKey:@"localizedName"]; } @catch (NSException *exception) { (void)exception; }
         if (![name isKindOfClass:[NSString class]] || name.length == 0) {
-            @try { name = [app valueForKey:@"displayName"]; } @catch (NSException *exception) { (void)exception; }
+            name = ProxyDisplayName(LSProxyForBundleID(bundleID));
         }
-
-        if (selfBundleID != nil && [bundleID isEqualToString:selfBundleID]) continue;
+        if (![name isKindOfClass:[NSString class]] || name.length == 0) {
+            name = SBSLocalizedNameForBundleID(bundleID);
+        }
         if (![name isKindOfClass:[NSString class]] || name.length == 0) name = bundleID;
-
         [result addObject:@{@"name": name, @"target": bundleID}];
+    };
+
+    // 来源 1：LSApplicationWorkspace（不同系统可能返回 proxy / 字符串 / 字典）
+    NSArray *proxies = WorkspaceAppProxies();
+    for (id app in proxies) {
+        if ([app isKindOfClass:[NSString class]]) {
+            addEntry((NSString *)app, nil);
+            continue;
+        }
+        if ([app isKindOfClass:[NSDictionary class]]) {
+            NSDictionary *infoDict = (NSDictionary *)app;
+            NSString *bundleID = infoDict[@"CFBundleIdentifier"] ?: infoDict[@"bundleIdentifier"];
+            NSString *name = infoDict[@"CFBundleDisplayName"] ?: infoDict[@"CFBundleName"];
+            addEntry(bundleID, name);
+            continue;
+        }
+        NSString *bundleID = ProxyStringValue(app, @"bundleIdentifier");
+        addEntry(bundleID, ProxyDisplayName(app));
     }
+
+    // 来源 2：MobileInstallationLookup
+    NSDictionary *lookup = MobileInstallationLookupCompat();
+    for (id key in lookup) {
+        if (![key isKindOfClass:[NSString class]]) continue;
+        NSString *name = nil;
+        id info = lookup[key];
+        if ([info isKindOfClass:[NSDictionary class]]) {
+            NSDictionary *infoDict = (NSDictionary *)info;
+            name = infoDict[@"CFBundleDisplayName"];
+            if (![name isKindOfClass:[NSString class]] || name.length == 0) {
+                name = infoDict[@"CFBundleName"];
+            }
+        }
+        addEntry((NSString *)key, name);
+    }
+
+    // 来源 3：SpringBoard 的 bundle id 列表
+    NSArray *sbsIdentifiers = SBSDisplayIdentifiers();
+    for (id bundleID in sbsIdentifiers) {
+        if ([bundleID isKindOfClass:[NSString class]]) addEntry((NSString *)bundleID, nil);
+    }
+
+    // 来源 4：直接扫描 App bundle 目录（宽松沙箱环境下的最后兜底）
+    NSArray<NSDictionary *> *filesystemApps = FilesystemAppEntries();
+    for (NSDictionary *entry in filesystemApps) {
+        addEntry(entry[@"target"], entry[@"name"]);
+    }
+
+    gInstalledAppsDiagnostics = [NSString stringWithFormat:@"LS=%lu MI=%lu SBS=%lu FS=%lu → %lu",
+                                 (unsigned long)proxies.count,
+                                 (unsigned long)lookup.count,
+                                 (unsigned long)sbsIdentifiers.count,
+                                 (unsigned long)filesystemApps.count,
+                                 (unsigned long)result.count];
 
     [result sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
         return [a[@"name"] localizedCaseInsensitiveCompare:b[@"name"]];
@@ -524,12 +749,12 @@ static void ResetMaskForLock(void) {
 }
 
 - (BOOL)handleSpecialCommand {
-    if ([self.currentExpression isEqualToString:@"9999"]) {
+    if ([self.currentExpression isEqualToString:kSettingsCode]) {
         [self resetExpression];
         [self openSettings];
         return YES;
     }
-    if ([self.currentExpression isEqualToString:@"8888"]) {
+    if ([self.currentExpression isEqualToString:kLinkedAppCode]) {
         [self resetExpression];
         [self handleLinkPassword];
         return YES;
@@ -548,7 +773,7 @@ static void ResetMaskForLock(void) {
 - (void)handleLinkPassword {
     NSArray *apps = LinkedAppEntries();
     if (apps.count == 0) {
-        [self showError:@"未配置链接 App\n请先输入 9999 进入设置添加"];
+        [self showError:[NSString stringWithFormat:@"未配置链接 App\n请先输入 %@ 进入设置添加", kSettingsCode]];
         return;
     }
     if (apps.count == 1) {
@@ -710,8 +935,8 @@ static void ResetMaskForLock(void) {
             [self showError:@"密码不能为空"];
             return;
         }
-        if ([newPassword isEqualToString:@"9999"] || [newPassword isEqualToString:@"8888"]) {
-            [self showError:@"9999 / 8888 为保留指令，请换一个"];
+        if ([newPassword isEqualToString:kSettingsCode] || [newPassword isEqualToString:kLinkedAppCode]) {
+            [self showError:[NSString stringWithFormat:@"%@ / %@ 为保留指令，请换一个", kSettingsCode, kLinkedAppCode]];
             return;
         }
 
@@ -829,7 +1054,7 @@ static void ResetMaskForLock(void) {
 }
 
 - (NSString *)tableView:(UITableView *)tableView titleForFooterInSection:(NSInteger)section {
-    if (section == 0) return @"仅「密码解锁」后回桌面再回来才计时；8888 / 9999 不享受免锁；上划关闭 App 后重开会重新上锁。";
+    if (section == 0) return @"仅「密码解锁」后回桌面再回来才计时；8888 / 0123456789 不享受免锁；上划关闭 App 后重开会重新上锁。";
     if (section == 1) return @"从已安装列表选择会自动填入 bundle id；也可手动填写 URL scheme。";
     return nil;
 }
@@ -876,7 +1101,7 @@ static void ResetMaskForLock(void) {
             cell.detailTextLabel.text = @"点按从已安装列表选择，自动填入 bundle id";
         }
     } else {
-        cell.textLabel.text = @"输入 9999 打开本设置\n输入 8888 解锁并跳转到链接 App（本 App 仍保持锁定）\n时间密码 HHmm 解锁当前 App；回桌面后不超过免锁时长再回来可直接进入\n上划关闭 App 后重新打开会重新上锁\n配置保存在各自 App 内，互不共享";
+        cell.textLabel.text = @"输入 0123456789 打开本设置\n输入 8888 解锁并跳转到链接 App（本 App 仍保持锁定）\n时间密码 HHmm 解锁当前 App；回桌面后不超过免锁时长再回来可直接进入\n上划关闭 App 后重新打开会重新上锁\n配置保存在各自 App 内，互不共享";
         cell.textLabel.font = [UIFont systemFontOfSize:14];
         cell.textLabel.textColor = [UIColor secondaryLabelColor];
         cell.selectionStyle = UITableViewCellSelectionStyleNone;
@@ -1015,10 +1240,17 @@ static void ResetMaskForLock(void) {
 - (void)loadInstalledApps {
     __weak typeof(self) weakSelf = self;
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-        NSArray<NSDictionary *> *apps = InstalledAppEntries();
+        NSArray<NSDictionary *> *first = InstalledAppEntries();
         dispatch_async(dispatch_get_main_queue(), ^{
             __strong typeof(weakSelf) strongSelf = weakSelf;
             if (strongSelf == nil) return;
+
+            NSArray<NSDictionary *> *apps = first;
+            if (apps.count == 0) {
+                // 个别系统上 LaunchServices 查询依赖主线程 runloop，空结果时主线程再试一次
+                NSArray<NSDictionary *> *retry = InstalledAppEntries();
+                if (retry.count > 0) apps = retry;
+            }
 
             strongSelf.allApps = apps;
             strongSelf.filteredApps = apps;
@@ -1026,7 +1258,9 @@ static void ResetMaskForLock(void) {
 
             if (apps.count == 0) {
                 UILabel *emptyLabel = [[UILabel alloc] initWithFrame:strongSelf.tableView.bounds];
-                emptyLabel.text = @"未获取到已安装 App\n可点右上角「手动输入」填写 bundle id 或 URL scheme";
+                emptyLabel.text = [NSString stringWithFormat:
+                    @"未获取到已安装 App\n诊断：%@\n可点右上角「手动输入」填写 bundle id 或 URL scheme",
+                    gInstalledAppsDiagnostics ?: @"-"];
                 emptyLabel.textAlignment = NSTextAlignmentCenter;
                 emptyLabel.numberOfLines = 0;
                 emptyLabel.textColor = [UIColor secondaryLabelColor];
@@ -1056,8 +1290,10 @@ static void ResetMaskForLock(void) {
     }
 
     NSDictionary *app = self.filteredApps[indexPath.row];
-    cell.textLabel.text = app[@"name"];
-    cell.detailTextLabel.text = app[@"target"];
+    NSString *name = app[@"name"];
+    NSString *target = app[@"target"];
+    cell.textLabel.text = name;
+    cell.detailTextLabel.text = [name isEqualToString:target] ? nil : target;
     cell.detailTextLabel.textColor = [UIColor secondaryLabelColor];
     cell.textLabel.font = [UIFont systemFontOfSize:17];
     cell.detailTextLabel.font = [UIFont systemFontOfSize:12];
