@@ -9,9 +9,10 @@
 //   8888 → 解锁并跳转到链接 App（本 App 本身仍保持锁定）
 //
 // 免锁规则（v1.2）：
-//   只有「密码解锁」（时间密码 / 自定义密码）才写入免锁状态；
-//   之后切到后台再回来，离开时长不超过「后台免锁时长」（默认 10 分钟，可配置）才直接进入。
-//   8888 / 9999 不写入免锁状态 —— 每次回到本 App 仍然重新上锁。
+//   只有「密码解锁」（时间密码 / 自定义密码）才进入免锁状态；
+//   之后切到后台（Home/上划回桌面）再回来，离开时长不超过「后台免锁时长」（默认 10 分钟，可配置）才直接进入。
+//   8888 / 9999 不进入免锁状态 —— 每次回到本 App 仍然重新上锁。
+//   免锁状态只保存在进程内存里：上划杀掉 App（或进程被系统回收）后重新打开，一律重新上锁。
 //
 // 构建：macOS 上 `xcrun -sdk iphoneos clang` 直接编译（见 .github/workflows/build.yml）
 
@@ -23,15 +24,14 @@
 static NSString * const kCustomPasswordKey = @"customPassword";
 static NSString * const kGracePeriodKey = @"com.ccifang.appmaskcalc.gracePeriodMinutes";
 static NSString * const kLinkedAppsKey = @"com.ccifang.appmaskcalc.linkedApps";
-static NSString * const kUnlockedKey = @"com.ccifang.appmaskcalc.unlocked";
-static NSString * const kPasswordUnlockedKey = @"com.ccifang.appmaskcalc.unlockedViaPassword";
-static NSString * const kUnlockedAtKey = @"com.ccifang.appmaskcalc.unlockedAt";
-static NSString * const kLastBackgroundKey = @"com.ccifang.appmaskcalc.lastBackgroundAt";
 
 static const NSInteger kDefaultGracePeriodMinutes = 10;
 
 static UIWindow *maskWindow = nil;
+// 解锁状态与离开后台时刻只放内存：进程一旦结束（用户上划强杀 / 系统回收），
+// 这两个变量随进程消失，下次启动必然重新上锁。
 static BOOL gUnlocked = NO;
+static NSDate *gLastBackgroundAt = nil;
 
 #pragma mark - Settings Storage
 
@@ -62,45 +62,30 @@ static void SetLinkedAppEntries(NSArray *entries) {
     [SharedDefaults() synchronize];
 }
 
-// 只有密码解锁（时间密码 / 自定义密码）才记录「已解锁」。
-// unlockedAt 仅作记录，真正判断免锁用的是 lastBackgroundAt。
-static void PersistPasswordUnlock(void) {
+// 只有密码解锁（时间密码 / 自定义密码）才会置位内存里的解锁标记。
+static void MarkUnlockedWithPassword(void) {
     gUnlocked = YES;
-    NSUserDefaults *defaults = SharedDefaults();
-    [defaults setBool:YES forKey:kUnlockedKey];
-    [defaults setBool:YES forKey:kPasswordUnlockedKey];
-    [defaults setObject:[NSDate date] forKey:kUnlockedAtKey];
     // 清掉上一次的离开时刻，确保免锁窗口只从「这次解锁后真正切到后台」开始计时
-    [defaults removeObjectForKey:kLastBackgroundKey];
-    [defaults synchronize];
+    gLastBackgroundAt = nil;
 }
 
-static void PersistLocked(void) {
+static void MarkLocked(void) {
     gUnlocked = NO;
-    NSUserDefaults *defaults = SharedDefaults();
-    [defaults setBool:NO forKey:kUnlockedKey];
-    [defaults setBool:NO forKey:kPasswordUnlockedKey];
-    [defaults removeObjectForKey:kUnlockedAtKey];
-    [defaults synchronize];
+    gLastBackgroundAt = nil;
 }
 
-static void PersistBackgroundTime(void) {
-    [SharedDefaults() setObject:[NSDate date] forKey:kLastBackgroundKey];
-    [SharedDefaults() synchronize];
+static void RecordBackgroundTime(void) {
+    gLastBackgroundAt = [NSDate date];
 }
 
-// 回前台/冷启动时判断是否仍在免锁窗口内：
-//   必须是「密码解锁」（8888/9999 不算），并且有明确的离开后台时刻，
-//   且离开时长 <= 免锁时长。没有离开记录时一律上锁，避免强杀后永久免锁。
+// 回前台时判断是否仍在免锁窗口内（仅同一进程内有效）：
+//   必须已密码解锁，并且有离开后台时刻，且离开时长 <= 免锁时长。
+// 进程重启后 gUnlocked 为 NO，因此「上划关闭 App 再打开」一定会重新上锁。
 static BOOL CanSkipLock(void) {
-    NSUserDefaults *defaults = SharedDefaults();
-    if (![defaults boolForKey:kUnlockedKey]) return NO;
-    if (![defaults boolForKey:kPasswordUnlockedKey]) return NO;
+    if (!gUnlocked) return NO;
+    if (gLastBackgroundAt == nil) return NO;
 
-    NSDate *leftAt = [defaults objectForKey:kLastBackgroundKey];
-    if (![leftAt isKindOfClass:[NSDate class]]) return NO;
-
-    NSTimeInterval gap = [[NSDate date] timeIntervalSinceDate:leftAt];
+    NSTimeInterval gap = [[NSDate date] timeIntervalSinceDate:gLastBackgroundAt];
     if (gap < 0) return NO;
     return gap <= (NSTimeInterval)GracePeriodMinutes() * 60.0;
 }
@@ -593,10 +578,10 @@ static void ResetMaskForLock(void) {
         return;
     }
 
-    // 8888 只负责跳转，不写入免锁状态：回到本 App 时仍然需要重新解锁。
+    // 8888 只负责跳转，不进入免锁状态：回到本 App 时仍然需要重新解锁。
     // 故意不收起伪装窗口 —— 目标 App 打开后本 App 进入后台；
     // 若跳转被系统静默拦截，也不会把当前 App 暴露出来。
-    PersistLocked();
+    MarkLocked();
 }
 
 - (NSString *)calculateExpression:(NSString *)expression {
@@ -638,9 +623,9 @@ static void ResetMaskForLock(void) {
     return [formatter stringFromDate:[NSDate date]];
 }
 
-// 密码解锁：写入免锁状态，收起伪装窗口
+// 密码解锁：置位内存免锁标记，收起伪装窗口
 - (void)unlockWithPassword {
-    PersistPasswordUnlock();
+    MarkUnlockedWithPassword();
     HideMaskWindow();
 }
 
@@ -844,7 +829,7 @@ static void ResetMaskForLock(void) {
 }
 
 - (NSString *)tableView:(UITableView *)tableView titleForFooterInSection:(NSInteger)section {
-    if (section == 0) return @"仅「密码解锁」后离开再返回才会计时；8888 / 9999 不享受免锁。";
+    if (section == 0) return @"仅「密码解锁」后回桌面再回来才计时；8888 / 9999 不享受免锁；上划关闭 App 后重开会重新上锁。";
     if (section == 1) return @"从已安装列表选择会自动填入 bundle id；也可手动填写 URL scheme。";
     return nil;
 }
@@ -891,7 +876,7 @@ static void ResetMaskForLock(void) {
             cell.detailTextLabel.text = @"点按从已安装列表选择，自动填入 bundle id";
         }
     } else {
-        cell.textLabel.text = @"输入 9999 打开本设置\n输入 8888 解锁并跳转到链接 App（本 App 仍保持锁定）\n时间密码 HHmm 解锁当前 App，离开后台不超过免锁时长再回来可直接进入\n配置保存在各自 App 内，互不共享";
+        cell.textLabel.text = @"输入 9999 打开本设置\n输入 8888 解锁并跳转到链接 App（本 App 仍保持锁定）\n时间密码 HHmm 解锁当前 App；回桌面后不超过免锁时长再回来可直接进入\n上划关闭 App 后重新打开会重新上锁\n配置保存在各自 App 内，互不共享";
         cell.textLabel.font = [UIFont systemFontOfSize:14];
         cell.textLabel.textColor = [UIColor secondaryLabelColor];
         cell.selectionStyle = UITableViewCellSelectionStyleNone;
@@ -1177,8 +1162,10 @@ static void ResetMaskForLock(void) {
 __attribute__((constructor)) static void AppMaskCalcEntry(void) {
     NSNotificationCenter *center = [NSNotificationCenter defaultCenter];
 
-    // 进程可能在后台被回收，constructor 执行时先按持久化状态恢复解锁标记
-    gUnlocked = CanSkipLock();
+    // 冷启动一律视为锁定：免锁状态只存在内存里，进程没了就失效。
+    // 这样「上划关闭 App 再打开」不会绕过锁屏；只有「Home 回桌面再回来」才享受免锁。
+    gUnlocked = NO;
+    gLastBackgroundAt = nil;
 
     // 统一入口：在免锁窗口内且此前已密码解锁，则保持解锁；否则上锁
     void (^evaluateLock)(void) = ^{
@@ -1187,7 +1174,7 @@ __attribute__((constructor)) static void AppMaskCalcEntry(void) {
             HideMaskWindow();
             return;
         }
-        PersistLocked();
+        MarkLocked();
         if (maskWindow != nil) {
             ResetMaskForLock();
         } else {
@@ -1207,9 +1194,9 @@ __attribute__((constructor)) static void AppMaskCalcEntry(void) {
         PresentMask(ws, YES);
     };
 
-    // 进入后台：记录离开时刻，供免锁判断使用
+    // 进入后台：记录离开时刻，供免锁判断使用（仅本进程内有效）
     void (^backgroundHandler)(NSNotification *) = ^(NSNotification *note) {
-        PersistBackgroundTime();
+        RecordBackgroundTime();
     };
 
     [center addObserverForName:UIApplicationDidFinishLaunchingNotification object:nil queue:nil usingBlock:^(NSNotification *note) {
