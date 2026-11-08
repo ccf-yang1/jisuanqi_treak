@@ -1,12 +1,17 @@
+
 // AppMaskCalc — 通用计算器密码伪装（TrollFools per-app 注入版）
-// 基于 telegram-mask（MIT License, Copyright (c) 2024 iOS宝藏 https://t.me/iosrxwy）
 // 通用化改造：移除全部 method hook 与 Substrate 依赖，任意 app 注入即生效。
 //
 // 解锁方式：输入表达式，计算结果等于当前密码即解锁。
 //   默认密码 = 当前时间 HHmm（24 小时制，如 14:30 → 1430）
 //   三指双击 → 可设置自定义密码（存于本 app 沙箱 NSUserDefaults，每个 app 独立）
 //   9999 → 打开设置（免锁时长、链接 App）
-//   8888 → 解锁并跳转到链接 App
+//   8888 → 解锁并跳转到链接 App（本 App 本身仍保持锁定）
+//
+// 免锁规则（v1.2）：
+//   只有「密码解锁」（时间密码 / 自定义密码）才写入免锁状态；
+//   之后切到后台再回来，离开时长不超过「后台免锁时长」（默认 10 分钟，可配置）才直接进入。
+//   8888 / 9999 不写入免锁状态 —— 每次回到本 App 仍然重新上锁。
 //
 // 构建：macOS 上 `xcrun -sdk iphoneos clang` 直接编译（见 .github/workflows/build.yml）
 
@@ -15,15 +20,15 @@
 #import <objc/message.h>
 #import <dlfcn.h>
 
-// app 从后台回到前台时是否重新上锁：1 = 重新锁（推荐），0 = 仅冷启动时上锁
-#define RELOCK_ON_FOREGROUND 1
-
 static NSString * const kCustomPasswordKey = @"customPassword";
 static NSString * const kGracePeriodKey = @"com.ccifang.appmaskcalc.gracePeriodMinutes";
 static NSString * const kLinkedAppsKey = @"com.ccifang.appmaskcalc.linkedApps";
 static NSString * const kUnlockedKey = @"com.ccifang.appmaskcalc.unlocked";
+static NSString * const kPasswordUnlockedKey = @"com.ccifang.appmaskcalc.unlockedViaPassword";
 static NSString * const kUnlockedAtKey = @"com.ccifang.appmaskcalc.unlockedAt";
 static NSString * const kLastBackgroundKey = @"com.ccifang.appmaskcalc.lastBackgroundAt";
+
+static const NSInteger kDefaultGracePeriodMinutes = 10;
 
 static UIWindow *maskWindow = nil;
 static BOOL gUnlocked = NO;
@@ -36,9 +41,9 @@ static NSUserDefaults *SharedDefaults(void) {
 
 static NSInteger GracePeriodMinutes(void) {
     NSUserDefaults *defaults = SharedDefaults();
-    if ([defaults objectForKey:kGracePeriodKey] == nil) return 10;
+    if ([defaults objectForKey:kGracePeriodKey] == nil) return kDefaultGracePeriodMinutes;
     NSInteger minutes = [defaults integerForKey:kGracePeriodKey];
-    return minutes < 0 ? 10 : minutes;
+    return minutes < 0 ? 0 : minutes;
 }
 
 static void SetGracePeriodMinutes(NSInteger minutes) {
@@ -57,18 +62,25 @@ static void SetLinkedAppEntries(NSArray *entries) {
     [SharedDefaults() synchronize];
 }
 
-// 解锁状态与进入后台时刻需要跨进程保留：iOS 可能在后台回收本进程，
-// 若只放在内存里，10 分钟内被系统杀进程后再进来会被误锁。
-static void PersistUnlocked(BOOL unlocked) {
-    gUnlocked = unlocked;
+// 只有密码解锁（时间密码 / 自定义密码）才记录「已解锁」。
+// unlockedAt 仅作记录，真正判断免锁用的是 lastBackgroundAt。
+static void PersistPasswordUnlock(void) {
+    gUnlocked = YES;
     NSUserDefaults *defaults = SharedDefaults();
-    [defaults setBool:unlocked forKey:kUnlockedKey];
-    if (unlocked) {
-        [defaults setObject:[NSDate date] forKey:kUnlockedAtKey];
-    } else {
-        [defaults removeObjectForKey:kUnlockedAtKey];
-        [defaults removeObjectForKey:kLastBackgroundKey];
-    }
+    [defaults setBool:YES forKey:kUnlockedKey];
+    [defaults setBool:YES forKey:kPasswordUnlockedKey];
+    [defaults setObject:[NSDate date] forKey:kUnlockedAtKey];
+    // 清掉上一次的离开时刻，确保免锁窗口只从「这次解锁后真正切到后台」开始计时
+    [defaults removeObjectForKey:kLastBackgroundKey];
+    [defaults synchronize];
+}
+
+static void PersistLocked(void) {
+    gUnlocked = NO;
+    NSUserDefaults *defaults = SharedDefaults();
+    [defaults setBool:NO forKey:kUnlockedKey];
+    [defaults setBool:NO forKey:kPasswordUnlockedKey];
+    [defaults removeObjectForKey:kUnlockedAtKey];
     [defaults synchronize];
 }
 
@@ -78,24 +90,45 @@ static void PersistBackgroundTime(void) {
 }
 
 // 回前台/冷启动时判断是否仍在免锁窗口内：
-// 「已解锁」且（没有离开记录，或离开时长不超过免锁时长）。
-// 离开时刻优先用进入后台时间，冷启动没有该记录时回退到解锁时刻，避免强杀后永久免锁。
+//   必须是「密码解锁」（8888/9999 不算），并且有明确的离开后台时刻，
+//   且离开时长 <= 免锁时长。没有离开记录时一律上锁，避免强杀后永久免锁。
 static BOOL CanSkipLock(void) {
     NSUserDefaults *defaults = SharedDefaults();
     if (![defaults boolForKey:kUnlockedKey]) return NO;
+    if (![defaults boolForKey:kPasswordUnlockedKey]) return NO;
 
-    NSInteger grace = GracePeriodMinutes();
-    NSTimeInterval limit = (NSTimeInterval)grace * 60.0;
+    NSDate *leftAt = [defaults objectForKey:kLastBackgroundKey];
+    if (![leftAt isKindOfClass:[NSDate class]]) return NO;
 
-    NSDate *reference = [defaults objectForKey:kLastBackgroundKey];
-    if (![reference isKindOfClass:[NSDate class]]) {
-        reference = [defaults objectForKey:kUnlockedAtKey];
-    }
-    if (![reference isKindOfClass:[NSDate class]]) return NO;
-
-    NSTimeInterval gap = [[NSDate date] timeIntervalSinceDate:reference];
+    NSTimeInterval gap = [[NSDate date] timeIntervalSinceDate:leftAt];
     if (gap < 0) return NO;
-    return gap <= limit;
+    return gap <= (NSTimeInterval)GracePeriodMinutes() * 60.0;
+}
+
+#pragma mark - Launch Services Helpers
+
+static Class LSApplicationWorkspaceClass(void) {
+    static Class cls = Nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        cls = NSClassFromString(@"LSApplicationWorkspace");
+        if (cls == Nil) {
+            dlopen("/System/Library/PrivateFrameworks/MobileCoreServices.framework/MobileCoreServices", RTLD_LAZY);
+            cls = NSClassFromString(@"LSApplicationWorkspace");
+        }
+        if (cls == Nil) {
+            dlopen("/System/Library/PrivateFrameworks/CoreServices.framework/CoreServices", RTLD_LAZY);
+            cls = NSClassFromString(@"LSApplicationWorkspace");
+        }
+    });
+    return cls;
+}
+
+static id LSDefaultWorkspace(void) {
+    Class cls = LSApplicationWorkspaceClass();
+    SEL sel = NSSelectorFromString(@"defaultWorkspace");
+    if (cls == Nil || ![cls respondsToSelector:sel]) return nil;
+    return ((id (*)(id, SEL))objc_msgSend)(cls, sel);
 }
 
 // 支持三种写法：完整 URL（twitter://...）、URL scheme（twitter://）、bundle id（com.xx.xx）
@@ -109,30 +142,63 @@ static BOOL IsBundleIdentifier(NSString *text) {
     return [regex firstMatchInString:text options:0 range:range] != nil;
 }
 
-static BOOL OpenBundleIdentifier(NSString *bundleID) {
-    Class workspaceClass = NSClassFromString(@"LSApplicationWorkspace");
-    if (workspaceClass == nil) {
-        dlopen("/System/Library/PrivateFrameworks/MobileCoreServices.framework/MobileCoreServices", RTLD_LAZY);
-        workspaceClass = NSClassFromString(@"LSApplicationWorkspace");
-    }
-    if (workspaceClass == nil) {
-        dlopen("/System/Library/PrivateFrameworks/CoreServices.framework/CoreServices", RTLD_LAZY);
-        workspaceClass = NSClassFromString(@"LSApplicationWorkspace");
-    }
-    if (workspaceClass == nil) return NO;
+static Class LSApplicationProxyClass(void) {
+    static Class cls = Nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        cls = NSClassFromString(@"LSApplicationProxy");
+        if (cls == Nil) {
+            dlopen("/System/Library/PrivateFrameworks/MobileCoreServices.framework/MobileCoreServices", RTLD_LAZY);
+            cls = NSClassFromString(@"LSApplicationProxy");
+        }
+        if (cls == Nil) {
+            dlopen("/System/Library/PrivateFrameworks/CoreServices.framework/CoreServices", RTLD_LAZY);
+            cls = NSClassFromString(@"LSApplicationProxy");
+        }
+    });
+    return cls;
+}
 
-    SEL defaultSel = NSSelectorFromString(@"defaultWorkspace");
-    id workspace = nil;
-    if ([workspaceClass respondsToSelector:defaultSel]) {
-        workspace = ((id (*)(id, SEL))objc_msgSend)(workspaceClass, defaultSel);
-    }
-    if (workspace == nil) return NO;
+// 兜底：部分环境会限制 openApplicationWithBundleID:，
+// 此时改从 LSApplicationProxy 取该 App 的 URL scheme 再打开
+static BOOL OpenBundleIdentifierViaScheme(NSString *bundleID) {
+    Class proxyClass = LSApplicationProxyClass();
+    SEL proxySel = NSSelectorFromString(@"applicationProxyForIdentifier:");
+    if (proxyClass == Nil || ![proxyClass respondsToSelector:proxySel]) return NO;
 
-    SEL openSel = NSSelectorFromString(@"openApplicationWithBundleID:");
-    if ([workspace respondsToSelector:openSel]) {
-        return ((BOOL (*)(id, SEL, id))objc_msgSend)(workspace, openSel, bundleID);
+    id proxy = ((id (*)(id, SEL, id))objc_msgSend)(proxyClass, proxySel, bundleID);
+    if (proxy == nil) return NO;
+
+    NSArray *schemes = nil;
+    @try { schemes = [proxy valueForKey:@"URLSchemes"]; } @catch (NSException *exception) { (void)exception; }
+    if (![schemes isKindOfClass:[NSArray class]]) {
+        @try { schemes = [proxy valueForKey:@"_boundURLSchemes"]; } @catch (NSException *exception) { (void)exception; }
+    }
+    if (![schemes isKindOfClass:[NSArray class]]) return NO;
+
+    for (NSString *scheme in schemes) {
+        if (![scheme isKindOfClass:[NSString class]] || scheme.length == 0) continue;
+        NSString *urlString = [scheme rangeOfString:@"://"].location == NSNotFound
+            ? [NSString stringWithFormat:@"%@://", scheme]
+            : scheme;
+        NSURL *url = [NSURL URLWithString:urlString];
+        if (url != nil) {
+            [[UIApplication sharedApplication] openURL:url options:@{} completionHandler:nil];
+            return YES;
+        }
     }
     return NO;
+}
+
+static BOOL OpenBundleIdentifier(NSString *bundleID) {
+    id workspace = LSDefaultWorkspace();
+    if (workspace != nil) {
+        SEL openSel = NSSelectorFromString(@"openApplicationWithBundleID:");
+        if ([workspace respondsToSelector:openSel]) {
+            if (((BOOL (*)(id, SEL, id))objc_msgSend)(workspace, openSel, bundleID)) return YES;
+        }
+    }
+    return OpenBundleIdentifierViaScheme(bundleID);
 }
 
 static BOOL OpenTargetApp(NSString *target) {
@@ -148,8 +214,10 @@ static BOOL OpenTargetApp(NSString *target) {
         }
     }
 
+    // bundle id 只走 LaunchServices，不再退化成 xxx:// 去猜 scheme，
+    // 这样目标不存在时能如实报错，而不是"假装打开了"
     if (IsBundleIdentifier(trimmed)) {
-        if (OpenBundleIdentifier(trimmed)) return YES;
+        return OpenBundleIdentifier(trimmed);
     }
 
     NSString *urlString = [NSString stringWithFormat:@"%@://", trimmed];
@@ -159,6 +227,54 @@ static BOOL OpenTargetApp(NSString *target) {
         return YES;
     }
     return NO;
+}
+
+// 返回已安装 App 列表：[{name, target(bundle id)}]，按名称排序。
+// 使用 Networking/LaunchServices 私有 API，TrollStore 注入场景可用。
+static NSArray<NSDictionary *> *InstalledAppEntries(void) {
+    NSMutableArray<NSDictionary *> *result = [NSMutableArray array];
+
+    id workspace = LSDefaultWorkspace();
+    if (workspace == nil) return result;
+
+    // 不同 iOS 版本可用的枚举方法略有差异，按优先级依次尝试
+    NSArray *apps = nil;
+    NSArray<NSString *> *selectors = @[@"allInstalledApplications", @"installedApplications"];
+    for (NSString *selectorName in selectors) {
+        SEL sel = NSSelectorFromString(selectorName);
+        if (![workspace respondsToSelector:sel]) continue;
+        id value = ((id (*)(id, SEL))objc_msgSend)(workspace, sel);
+        if ([value isKindOfClass:[NSArray class]] && [(NSArray *)value count] > 0) {
+            apps = (NSArray *)value;
+            break;
+        }
+    }
+    if (apps == nil) return result;
+
+    NSString *selfBundleID = [[NSBundle mainBundle] bundleIdentifier];
+
+    for (id app in apps) {
+        NSString *bundleID = nil;
+        NSString *name = nil;
+
+        @try { bundleID = [app valueForKey:@"bundleIdentifier"]; } @catch (NSException *exception) { (void)exception; }
+        if (![bundleID isKindOfClass:[NSString class]] || bundleID.length == 0) continue;
+
+        @try { name = [app valueForKey:@"localizedName"]; } @catch (NSException *exception) { (void)exception; }
+        if (![name isKindOfClass:[NSString class]] || name.length == 0) {
+            @try { name = [app valueForKey:@"displayName"]; } @catch (NSException *exception) { (void)exception; }
+        }
+
+        if (selfBundleID != nil && [bundleID isEqualToString:selfBundleID]) continue;
+        if (![name isKindOfClass:[NSString class]] || name.length == 0) name = bundleID;
+
+        [result addObject:@{@"name": name, @"target": bundleID}];
+    }
+
+    [result sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+        return [a[@"name"] localizedCaseInsensitiveCompare:b[@"name"]];
+    }];
+    return result;
 }
 
 #pragma mark - Interfaces
@@ -175,6 +291,16 @@ static BOOL OpenTargetApp(NSString *target) {
 @interface SettingsViewController : UIViewController <UITableViewDataSource, UITableViewDelegate>
 @property (nonatomic, strong) UITableView *tableView;
 @property (nonatomic, strong) NSMutableArray *apps;
+@end
+
+// 从已安装 App 列表里选择，点选后自动回填 bundle id
+@interface AppPickerViewController : UIViewController <UITableViewDataSource, UITableViewDelegate, UISearchBarDelegate>
+@property (nonatomic, copy) void (^onSelect)(NSDictionary *entry);
+@property (nonatomic, strong) UITableView *tableView;
+@property (nonatomic, strong) UISearchBar *searchBar;
+@property (nonatomic, strong) UIActivityIndicatorView *spinner;
+@property (nonatomic, strong) NSArray<NSDictionary *> *allApps;
+@property (nonatomic, strong) NSArray<NSDictionary *> *filteredApps;
 @end
 
 #pragma mark - Window Helpers
@@ -214,7 +340,10 @@ static void PresentMask(UIWindowScene *preferred, BOOL makeKey) {
     UIWindow *window = [[UIWindow alloc] initWithWindowScene:scene];
     window.frame = [UIScreen mainScreen].bounds;
     window.rootViewController = calcVC;
-    window.windowLevel = UIWindowLevelAlert + 999.0;
+    // 只比宿主普通窗口高一级：既能盖住 app 内容，又不会把系统 alert 窗口
+    //（UIAlertController / 键盘等位于 Alert / StatusBar 层级）压到伪装层下面，
+    // 避免设置页里的弹窗"看不见、点不动"。
+    window.windowLevel = UIWindowLevelNormal + 1.0;
     window.backgroundColor = [UIColor blackColor];
     window.hidden = NO;
     if (makeKey) [window makeKeyAndVisible];
@@ -232,6 +361,10 @@ static void HideMaskWindow(void) {
     if (window == nil) return;
 
     maskWindow = nil;
+    UIViewController *root = window.rootViewController;
+    if (root.presentedViewController != nil) {
+        [root dismissViewControllerAnimated:NO completion:nil];
+    }
     window.rootViewController = nil;
     window.hidden = YES;
 
@@ -244,6 +377,19 @@ static void HideMaskWindow(void) {
             }
         }
     }
+}
+
+// 需要重新上锁时，把伪装窗口恢复成计算器（关掉可能还开着的设置页）
+static void ResetMaskForLock(void) {
+    UIWindow *window = maskWindow;
+    if (window == nil) return;
+
+    UIViewController *root = window.rootViewController;
+    if (root.presentedViewController != nil) {
+        [root dismissViewControllerAnimated:NO completion:nil];
+    }
+    window.hidden = NO;
+    [window makeKeyAndVisible];
 }
 
 #pragma mark - Calculator UI
@@ -382,7 +528,7 @@ static void HideMaskWindow(void) {
 
     NSString *currentPassword = [self getCurrentPassword];
     if ([self.currentExpression isEqualToString:currentPassword]) {
-        [self hideCalculatorView];
+        [self unlockWithPassword];
     }
 }
 
@@ -407,6 +553,7 @@ static void HideMaskWindow(void) {
 }
 
 - (void)openSettings {
+    if (self.presentedViewController != nil) return;
     SettingsViewController *settings = [[SettingsViewController alloc] init];
     UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:settings];
     nav.modalPresentationStyle = UIModalPresentationFullScreen;
@@ -441,12 +588,15 @@ static void HideMaskWindow(void) {
 
 - (void)launchLinkedApp:(NSDictionary *)info {
     NSString *target = info[@"target"];
-    if (OpenTargetApp(target)) {
-        // 跳转成功后再收起伪装窗口；失败则保留计算器并提示，避免回到未解锁状态
-        [self hideCalculatorView];
-    } else {
+    if (!OpenTargetApp(target)) {
         [self showError:@"无法打开目标 App\n请检查 bundle id 或 URL scheme"];
+        return;
     }
+
+    // 8888 只负责跳转，不写入免锁状态：回到本 App 时仍然需要重新解锁。
+    // 故意不收起伪装窗口 —— 目标 App 打开后本 App 进入后台；
+    // 若跳转被系统静默拦截，也不会把当前 App 暴露出来。
+    PersistLocked();
 }
 
 - (NSString *)calculateExpression:(NSString *)expression {
@@ -488,10 +638,10 @@ static void HideMaskWindow(void) {
     return [formatter stringFromDate:[NSDate date]];
 }
 
-// 解锁：收起伪装窗口，并把宿主 app 原本的窗口恢复为 key window
-- (void)hideCalculatorView {
+// 密码解锁：写入免锁状态，收起伪装窗口
+- (void)unlockWithPassword {
+    PersistPasswordUnlock();
     HideMaskWindow();
-    PersistUnlocked(YES);
 }
 
 // 三指双击：自定义密码管理菜单
@@ -693,6 +843,12 @@ static void HideMaskWindow(void) {
     return @"说明";
 }
 
+- (NSString *)tableView:(UITableView *)tableView titleForFooterInSection:(NSInteger)section {
+    if (section == 0) return @"仅「密码解锁」后离开再返回才会计时；8888 / 9999 不享受免锁。";
+    if (section == 1) return @"从已安装列表选择会自动填入 bundle id；也可手动填写 URL scheme。";
+    return nil;
+}
+
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
     if (section == 0) return 1;
     if (section == 1) return self.apps.count + 1;
@@ -713,6 +869,7 @@ static void HideMaskWindow(void) {
     cell.textLabel.font = [UIFont systemFontOfSize:17];
     cell.textLabel.numberOfLines = 0;
     cell.detailTextLabel.text = nil;
+    cell.detailTextLabel.textColor = [UIColor secondaryLabelColor];
 
     if (indexPath.section == 0) {
         cell.textLabel.text = @"后台免锁时长";
@@ -731,10 +888,10 @@ static void HideMaskWindow(void) {
         } else {
             cell.textLabel.text = @"添加 App";
             cell.textLabel.textColor = [UIColor systemBlueColor];
-            cell.detailTextLabel.text = @"填写 bundle id 或 URL scheme";
+            cell.detailTextLabel.text = @"点按从已安装列表选择，自动填入 bundle id";
         }
     } else {
-        cell.textLabel.text = @"输入 9999 打开本设置\n输入 8888 解锁并跳转到链接 App\n时间密码 HHmm 照常解锁当前 App\n配置保存在各自 App 内，互不共享";
+        cell.textLabel.text = @"输入 9999 打开本设置\n输入 8888 解锁并跳转到链接 App（本 App 仍保持锁定）\n时间密码 HHmm 解锁当前 App，离开后台不超过免锁时长再回来可直接进入\n配置保存在各自 App 内，互不共享";
         cell.textLabel.font = [UIFont systemFontOfSize:14];
         cell.textLabel.textColor = [UIColor secondaryLabelColor];
         cell.selectionStyle = UITableViewCellSelectionStyleNone;
@@ -750,19 +907,19 @@ static void HideMaskWindow(void) {
         if (indexPath.row < (NSInteger)self.apps.count) {
             [self presentActionsForAppAtIndex:indexPath.row];
         } else {
-            [self addOrEditAppAtIndex:-1];
+            [self presentAppPickerForIndex:-1];
         }
     }
 }
 
 - (CGFloat)tableView:(UITableView *)tableView heightForRowAtIndexPath:(NSIndexPath *)indexPath {
-    if (indexPath.section == 2) return 120;
+    if (indexPath.section == 2) return 150;
     return UITableViewAutomaticDimension;
 }
 
 - (void)editGracePeriod {
     UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"后台免锁时长"
-                                                                   message:@"单位：分钟，0 表示每次回前台都重新上锁"
+                                                                   message:@"单位：分钟。0 表示每次回前台都重新上锁"
                                                             preferredStyle:UIAlertControllerStyleAlert];
     [alert addTextFieldWithConfigurationHandler:^(UITextField * _Nonnull textField) {
         textField.placeholder = @"分钟";
@@ -772,8 +929,7 @@ static void HideMaskWindow(void) {
     [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
     [alert addAction:[UIAlertAction actionWithTitle:@"保存" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
         NSString *text = alert.textFields[0].text;
-        NSInteger minutes = text.length > 0 ? [text integerValue] : 10;
-        if (minutes < 0) minutes = 0;
+        NSInteger minutes = text.length > 0 ? [text integerValue] : kDefaultGracePeriodMinutes;
         SetGracePeriodMinutes(minutes);
         [self.tableView reloadData];
     }]];
@@ -786,10 +942,16 @@ static void HideMaskWindow(void) {
                                                                    message:info[@"target"]
                                                             preferredStyle:UIAlertControllerStyleActionSheet];
     [sheet addAction:[UIAlertAction actionWithTitle:@"测试跳转" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
-        OpenTargetApp(info[@"target"]);
+        if (!OpenTargetApp(info[@"target"])) {
+            UIAlertController *error = [UIAlertController alertControllerWithTitle:@"打开失败"
+                                                                            message:@"请检查 bundle id 或 URL scheme 是否正确"
+                                                                     preferredStyle:UIAlertControllerStyleAlert];
+            [error addAction:[UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDefault handler:nil]];
+            [self presentViewController:error animated:YES completion:nil];
+        }
     }]];
-    [sheet addAction:[UIAlertAction actionWithTitle:@"编辑" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
-        [self addOrEditAppAtIndex:index];
+    [sheet addAction:[UIAlertAction actionWithTitle:@"重新选择 App" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
+        [self presentAppPickerForIndex:index];
     }]];
     [sheet addAction:[UIAlertAction actionWithTitle:@"删除" style:UIAlertActionStyleDestructive handler:^(UIAlertAction * _Nonnull action) {
         [self.apps removeObjectAtIndex:index];
@@ -802,40 +964,206 @@ static void HideMaskWindow(void) {
     [self presentViewController:sheet animated:YES completion:nil];
 }
 
-- (void)addOrEditAppAtIndex:(NSInteger)index {
-    BOOL editing = index >= 0;
-    NSDictionary *existing = editing ? self.apps[index] : nil;
-    UIAlertController *alert = [UIAlertController alertControllerWithTitle:(editing ? @"编辑链接 App" : @"添加链接 App")
-                                                                   message:@"目标填 bundle id（com.xx.xx）或 URL scheme（如 twitter://）"
+// 打开 App 选择器（push 到设置导航栈，避免多层 modal 导致首次点按异常）
+- (void)presentAppPickerForIndex:(NSInteger)index {
+    AppPickerViewController *picker = [[AppPickerViewController alloc] init];
+    __weak typeof(self) weakSelf = self;
+    picker.onSelect = ^(NSDictionary *entry) {
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (strongSelf == nil) return;
+
+        NSMutableDictionary *item = [NSMutableDictionary dictionary];
+        item[@"name"] = entry[@"name"] ?: entry[@"target"];
+        item[@"target"] = entry[@"target"];
+
+        if (index >= 0 && index < (NSInteger)strongSelf.apps.count) {
+            strongSelf.apps[index] = item;
+        } else {
+            [strongSelf.apps addObject:item];
+        }
+        SetLinkedAppEntries(strongSelf.apps);
+        [strongSelf.tableView reloadData];
+    };
+    [self.navigationController pushViewController:picker animated:YES];
+}
+
+@end
+
+#pragma mark - App Picker
+
+@implementation AppPickerViewController
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.title = @"选择 App";
+    self.view.backgroundColor = [UIColor systemBackgroundColor];
+    self.allApps = @[];
+    self.filteredApps = @[];
+
+    self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithTitle:@"手动输入"
+                                                                              style:UIBarButtonItemStylePlain
+                                                                             target:self
+                                                                             action:@selector(manualInputTapped)];
+
+    self.tableView = [[UITableView alloc] initWithFrame:self.view.bounds style:UITableViewStylePlain];
+    self.tableView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    self.tableView.dataSource = self;
+    self.tableView.delegate = self;
+    self.tableView.rowHeight = 60;
+    [self.view addSubview:self.tableView];
+
+    self.searchBar = [[UISearchBar alloc] initWithFrame:CGRectMake(0, 0, self.view.bounds.size.width, 52)];
+    self.searchBar.placeholder = @"搜索名称或 bundle id";
+    self.searchBar.searchBarStyle = UISearchBarStyleMinimal;
+    self.searchBar.delegate = self;
+    self.tableView.tableHeaderView = self.searchBar;
+
+    self.spinner = [[UIActivityIndicatorView alloc] initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleMedium];
+    self.spinner.center = CGPointMake(self.view.bounds.size.width / 2.0, self.view.bounds.size.height / 2.0);
+    self.spinner.hidesWhenStopped = YES;
+    [self.view addSubview:self.spinner];
+    [self.spinner startAnimating];
+
+    [self loadInstalledApps];
+}
+
+- (void)loadInstalledApps {
+    __weak typeof(self) weakSelf = self;
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        NSArray<NSDictionary *> *apps = InstalledAppEntries();
+        dispatch_async(dispatch_get_main_queue(), ^{
+            __strong typeof(weakSelf) strongSelf = weakSelf;
+            if (strongSelf == nil) return;
+
+            strongSelf.allApps = apps;
+            strongSelf.filteredApps = apps;
+            [strongSelf.spinner stopAnimating];
+
+            if (apps.count == 0) {
+                UILabel *emptyLabel = [[UILabel alloc] initWithFrame:strongSelf.tableView.bounds];
+                emptyLabel.text = @"未获取到已安装 App\n可点右上角「手动输入」填写 bundle id 或 URL scheme";
+                emptyLabel.textAlignment = NSTextAlignmentCenter;
+                emptyLabel.numberOfLines = 0;
+                emptyLabel.textColor = [UIColor secondaryLabelColor];
+                emptyLabel.font = [UIFont systemFontOfSize:15];
+                strongSelf.tableView.backgroundView = emptyLabel;
+            } else {
+                strongSelf.tableView.backgroundView = nil;
+            }
+            [strongSelf.tableView reloadData];
+        });
+    });
+}
+
+- (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView {
+    return 1;
+}
+
+- (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
+    return self.filteredApps.count;
+}
+
+- (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
+    static NSString *cellId = @"appCell";
+    UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:cellId];
+    if (cell == nil) {
+        cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:cellId];
+    }
+
+    NSDictionary *app = self.filteredApps[indexPath.row];
+    cell.textLabel.text = app[@"name"];
+    cell.detailTextLabel.text = app[@"target"];
+    cell.detailTextLabel.textColor = [UIColor secondaryLabelColor];
+    cell.textLabel.font = [UIFont systemFontOfSize:17];
+    cell.detailTextLabel.font = [UIFont systemFontOfSize:12];
+    cell.selectionStyle = UITableViewCellSelectionStyleDefault;
+    return cell;
+}
+
+- (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
+    [tableView deselectRowAtIndexPath:indexPath animated:YES];
+    if (indexPath.row < (NSInteger)self.filteredApps.count) {
+        [self finishWithEntry:self.filteredApps[indexPath.row]];
+    }
+}
+
+- (void)searchBar:(UISearchBar *)searchBar textDidChange:(NSString *)searchText {
+    NSString *keyword = [searchText stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (keyword.length == 0) {
+        self.filteredApps = self.allApps;
+    } else {
+        NSMutableArray *matches = [NSMutableArray array];
+        for (NSDictionary *app in self.allApps) {
+            NSString *name = app[@"name"] ?: @"";
+            NSString *target = app[@"target"] ?: @"";
+            if ([name rangeOfString:keyword options:NSCaseInsensitiveSearch].location != NSNotFound ||
+                [target rangeOfString:keyword options:NSCaseInsensitiveSearch].location != NSNotFound) {
+                [matches addObject:app];
+            }
+        }
+        self.filteredApps = matches;
+    }
+    [self.tableView reloadData];
+}
+
+- (void)searchBarSearchButtonClicked:(UISearchBar *)searchBar {
+    [searchBar resignFirstResponder];
+}
+
+- (void)finishWithEntry:(NSDictionary *)entry {
+    NSString *target = entry[@"target"];
+    if (![target isKindOfClass:[NSString class]] || target.length == 0) return;
+
+    NSString *name = entry[@"name"];
+    if (![name isKindOfClass:[NSString class]] || name.length == 0) name = target;
+
+    NSDictionary *item = @{@"name": name, @"target": target};
+    void (^onSelect)(NSDictionary *) = self.onSelect;
+    self.onSelect = nil;
+    if (onSelect) onSelect(item);
+    [self.navigationController popViewControllerAnimated:YES];
+}
+
+- (void)manualInputTapped {
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"手动输入"
+                                                                   message:@"填 bundle id（com.xx.xx）或 URL scheme（如 twitter://）"
                                                             preferredStyle:UIAlertControllerStyleAlert];
     [alert addTextFieldWithConfigurationHandler:^(UITextField * _Nonnull textField) {
-        textField.placeholder = @"名称";
-        textField.text = existing[@"name"];
+        textField.placeholder = @"名称（可留空）";
     }];
     [alert addTextFieldWithConfigurationHandler:^(UITextField * _Nonnull textField) {
         textField.placeholder = @"com.xx.xx 或 twitter://";
-        textField.text = existing[@"target"];
         textField.autocapitalizationType = UITextAutocapitalizationTypeNone;
         textField.autocorrectionType = UITextAutocorrectionTypeNo;
     }];
     [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
-    [alert addAction:[UIAlertAction actionWithTitle:@"保存" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
-        NSString *name = [alert.textFields[0].text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-        NSString *target = [alert.textFields[1].text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-        if (target.length == 0) return;
+
+    __weak typeof(self) weakSelf = self;
+    __weak UIAlertController *weakAlert = alert;
+    [alert addAction:[UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        UIAlertController *strongAlert = weakAlert;
+        if (strongSelf == nil || strongAlert == nil) return;
+
+        NSCharacterSet *trimSet = [NSCharacterSet whitespaceAndNewlineCharacterSet];
+        NSString *name = [strongAlert.textFields[0].text stringByTrimmingCharactersInSet:trimSet];
+        NSString *target = [strongAlert.textFields[1].text stringByTrimmingCharactersInSet:trimSet];
+
+        if (target.length == 0) {
+            UIAlertController *error = [UIAlertController alertControllerWithTitle:@"错误"
+                                                                            message:@"目标不能为空"
+                                                                     preferredStyle:UIAlertControllerStyleAlert];
+            [error addAction:[UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDefault handler:nil]];
+            [strongSelf presentViewController:error animated:YES completion:nil];
+            return;
+        }
         if (name.length == 0) name = target;
 
-        NSMutableDictionary *item = [NSMutableDictionary dictionary];
-        item[@"name"] = name;
-        item[@"target"] = target;
-
-        if (editing) {
-            self.apps[index] = item;
-        } else {
-            [self.apps addObject:item];
-        }
-        SetLinkedAppEntries(self.apps);
-        [self.tableView reloadData];
+        NSDictionary *entry = @{@"name": name, @"target": target};
+        // 等当前 alert 收起后再 pop，避免同时 dismiss/pop 冲突
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [strongSelf finishWithEntry:entry];
+        });
     }]];
     [self presentViewController:alert animated:YES completion:nil];
 }
@@ -852,15 +1180,19 @@ __attribute__((constructor)) static void AppMaskCalcEntry(void) {
     // 进程可能在后台被回收，constructor 执行时先按持久化状态恢复解锁标记
     gUnlocked = CanSkipLock();
 
-    // 统一入口：在免锁窗口内且此前已解锁，则保持解锁；否则上锁
+    // 统一入口：在免锁窗口内且此前已密码解锁，则保持解锁；否则上锁
     void (^evaluateLock)(void) = ^{
         if (CanSkipLock()) {
             gUnlocked = YES;
             HideMaskWindow();
             return;
         }
-        PersistUnlocked(NO);
-        ShowMaskIfNeeded();
+        PersistLocked();
+        if (maskWindow != nil) {
+            ResetMaskForLock();
+        } else {
+            ShowMaskIfNeeded();
+        }
     };
 
     // scene 连接/激活时，仅在需要上锁时构建伪装窗口
@@ -875,7 +1207,7 @@ __attribute__((constructor)) static void AppMaskCalcEntry(void) {
         PresentMask(ws, YES);
     };
 
-    // 进入后台：记录时刻，保留 unlocked 标记供免锁判断
+    // 进入后台：记录离开时刻，供免锁判断使用
     void (^backgroundHandler)(NSNotification *) = ^(NSNotification *note) {
         PersistBackgroundTime();
     };
@@ -883,11 +1215,9 @@ __attribute__((constructor)) static void AppMaskCalcEntry(void) {
     [center addObserverForName:UIApplicationDidFinishLaunchingNotification object:nil queue:nil usingBlock:^(NSNotification *note) {
         evaluateLock();
     }];
-#if RELOCK_ON_FOREGROUND
     [center addObserverForName:UIApplicationWillEnterForegroundNotification object:nil queue:nil usingBlock:^(NSNotification *note) {
         evaluateLock();
     }];
-#endif
     [center addObserverForName:UIApplicationDidEnterBackgroundNotification object:nil queue:nil usingBlock:backgroundHandler];
     [center addObserverForName:UISceneWillConnectNotification object:nil queue:nil usingBlock:sceneConnectHandler];
     [center addObserverForName:UISceneDidActivateNotification object:nil queue:nil usingBlock:sceneActivateHandler];
