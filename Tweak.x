@@ -1,4 +1,5 @@
 
+
 // AppMaskCalc — 通用计算器密码伪装（TrollFools per-app 注入版）
 // 通用化改造：移除全部 method hook 与 Substrate 依赖，任意 app 注入即生效。
 //
@@ -8,9 +9,11 @@
 //   0123456789 → 打开设置（免锁时长、链接 App）
 //   8888 → 解锁并跳转到链接 App（本 App 本身仍保持锁定）
 //
-// 免锁规则（v1.2）：
+// 免锁规则（v1.3）：
 //   只有「密码解锁」（时间密码 / 自定义密码）才进入免锁状态；
-//   之后切到后台（Home/上划回桌面）再回来，离开时长不超过「后台免锁时长」（默认 10 分钟，可配置）才直接进入。
+//   之后每次离开 App（切到后台 / 锁屏 / 进控制中心等失去活跃）单独计时，
+//   离开时长不超过「后台免锁时长」（默认 10 分钟，可配置）就直接进入，超过则重新上锁。
+//   回到前台即结束本轮计时，所以「一直在用、偶尔切出去几次」不会累加，反复切换也不会被锁。
 //   8888 / 0123456789 不进入免锁状态 —— 每次回到本 App 仍然重新上锁。
 //   免锁状态只保存在进程内存里：上划杀掉 App（或进程被系统回收）后重新打开，一律重新上锁。
 //
@@ -32,10 +35,12 @@ static NSString * const kSettingsCode = @"0123456789";
 static NSString * const kLinkedAppCode = @"8888";
 
 static UIWindow *maskWindow = nil;
-// 解锁状态与离开后台时刻只放内存：进程一旦结束（用户上划强杀 / 系统回收），
-// 这两个变量随进程消失，下次启动必然重新上锁。
+// 解锁状态与本轮「离开 App 的时刻」只放内存：进程一旦结束（用户上划强杀 / 系统回收），
+// 这些状态随进程消失，下次启动必然重新上锁。
 static BOOL gUnlocked = NO;
-static NSDate *gLastBackgroundAt = nil;
+// 本轮离开 App 的起点（进入后台 / 失去活跃的第一时刻）。
+// 回到前台就清空，因此每次离开独立计时，多次短暂切换不会累加。
+static NSDate *gAwaySince = nil;
 
 #pragma mark - Settings Storage
 
@@ -69,29 +74,37 @@ static void SetLinkedAppEntries(NSArray *entries) {
 // 只有密码解锁（时间密码 / 自定义密码）才会置位内存里的解锁标记。
 static void MarkUnlockedWithPassword(void) {
     gUnlocked = YES;
-    // 清掉上一次的离开时刻，确保免锁窗口只从「这次解锁后真正切到后台」开始计时
-    gLastBackgroundAt = nil;
+    // 免锁窗口从「这次解锁后真正离开 App」才开始计时
+    gAwaySince = nil;
 }
 
 static void MarkLocked(void) {
     gUnlocked = NO;
-    gLastBackgroundAt = nil;
+    gAwaySince = nil;
 }
 
-static void RecordBackgroundTime(void) {
-    gLastBackgroundAt = [NSDate date];
+// 离开 App：后台 / 失去活跃会连续触发多个通知，只记录第一次的时刻，
+// 保证计时起点是本轮最后一次真正使用 App 的时间。
+static void MarkAway(void) {
+    if (gAwaySince == nil) gAwaySince = [NSDate date];
 }
 
-// 回前台时判断是否仍在免锁窗口内（仅同一进程内有效）：
-//   必须已密码解锁，并且有离开后台时刻，且离开时长 <= 免锁时长。
-// 进程重启后 gUnlocked 为 NO，因此「上划关闭 App 再打开」一定会重新上锁。
-static BOOL CanSkipLock(void) {
-    if (!gUnlocked) return NO;
-    if (gLastBackgroundAt == nil) return NO;
+// 回到前台且决定保持解锁：结束本轮离开计时。
+// 下次再离开时重新从 0 开始计，反复短暂切换不会被累加成一次长离开。
+static void MarkActive(void) {
+    gAwaySince = nil;
+}
 
-    NSTimeInterval gap = [[NSDate date] timeIntervalSinceDate:gLastBackgroundAt];
-    if (gap < 0) return NO;
-    return gap <= (NSTimeInterval)GracePeriodMinutes() * 60.0;
+// 本轮已离开的秒数（从未记录离开时返回 0）
+static NSTimeInterval SecondsAway(void) {
+    if (gAwaySince == nil) return 0;
+    NSTimeInterval gap = [[NSDate date] timeIntervalSinceDate:gAwaySince];
+    return gap < 0 ? 0 : gap;
+}
+
+// 本轮离开是否仍免锁窗口内（与「解锁后用了多久」无关）
+static BOOL IsAwayWithinGrace(void) {
+    return SecondsAway() <= (NSTimeInterval)GracePeriodMinutes() * 60.0;
 }
 
 #pragma mark - Launch Services Helpers
@@ -1399,17 +1412,11 @@ __attribute__((constructor)) static void AppMaskCalcEntry(void) {
     NSNotificationCenter *center = [NSNotificationCenter defaultCenter];
 
     // 冷启动一律视为锁定：免锁状态只存在内存里，进程没了就失效。
-    // 这样「上划关闭 App 再打开」不会绕过锁屏；只有「Home 回桌面再回来」才享受免锁。
+    // 这样「上划关闭 App 再打开」不会绕过锁屏；只有「切出去再回来」才享受免锁。
     gUnlocked = NO;
-    gLastBackgroundAt = nil;
+    gAwaySince = nil;
 
-    // 统一入口：在免锁窗口内且此前已密码解锁，则保持解锁；否则上锁
-    void (^evaluateLock)(void) = ^{
-        if (CanSkipLock()) {
-            gUnlocked = YES;
-            HideMaskWindow();
-            return;
-        }
+    void (^showLock)(void) = ^{
         MarkLocked();
         if (maskWindow != nil) {
             ResetMaskForLock();
@@ -1418,21 +1425,45 @@ __attribute__((constructor)) static void AppMaskCalcEntry(void) {
         }
     };
 
+    // 统一入口：是否解锁只看「本轮离开 App 的时长」，与解锁后用了多久无关。
+    //   - 从未在本进程密码解锁过 → 上锁（上划强杀后重新打开走这里）
+    //   - 已解锁且离开时长 > 免锁时长 → 重新上锁
+    //   - 已解锁且离开时长在免锁窗口内（含未记录到离开）→ 保持解锁，并结束本轮计时
+    void (^evaluateLock)(void) = ^{
+        if (!gUnlocked) {
+            showLock();
+            return;
+        }
+        if (gAwaySince != nil && !IsAwayWithinGrace()) {
+            showLock();
+            return;
+        }
+        MarkActive();
+        HideMaskWindow();
+    };
+
+    // 离开 App：后台与失去活跃都会触发，MarkAway 内部保证只取第一次的时刻
+    void (^awayHandler)(NSNotification *) = ^(NSNotification *note) {
+        MarkAway();
+    };
+
     // scene 连接/激活时，仅在需要上锁时构建伪装窗口
     void (^sceneConnectHandler)(NSNotification *) = ^(NSNotification *note) {
-        if (gUnlocked) return;
         UIWindowScene *ws = [note.object isKindOfClass:[UIWindowScene class]] ? (UIWindowScene *)note.object : nil;
-        PresentMask(ws, NO);
+        if (!gUnlocked) {
+            PresentMask(ws, NO);
+            return;
+        }
+        if (gAwaySince != nil && !IsAwayWithinGrace()) {
+            MarkLocked();
+            PresentMask(ws, NO);
+        }
     };
     void (^sceneActivateHandler)(NSNotification *) = ^(NSNotification *note) {
+        evaluateLock();
         if (gUnlocked) return;
         UIWindowScene *ws = [note.object isKindOfClass:[UIWindowScene class]] ? (UIWindowScene *)note.object : nil;
         PresentMask(ws, YES);
-    };
-
-    // 进入后台：记录离开时刻，供免锁判断使用（仅本进程内有效）
-    void (^backgroundHandler)(NSNotification *) = ^(NSNotification *note) {
-        RecordBackgroundTime();
     };
 
     [center addObserverForName:UIApplicationDidFinishLaunchingNotification object:nil queue:nil usingBlock:^(NSNotification *note) {
@@ -1441,7 +1472,12 @@ __attribute__((constructor)) static void AppMaskCalcEntry(void) {
     [center addObserverForName:UIApplicationWillEnterForegroundNotification object:nil queue:nil usingBlock:^(NSNotification *note) {
         evaluateLock();
     }];
-    [center addObserverForName:UIApplicationDidEnterBackgroundNotification object:nil queue:nil usingBlock:backgroundHandler];
+    [center addObserverForName:UIApplicationDidBecomeActiveNotification object:nil queue:nil usingBlock:^(NSNotification *note) {
+        evaluateLock();
+    }];
+    [center addObserverForName:UIApplicationDidEnterBackgroundNotification object:nil queue:nil usingBlock:awayHandler];
+    [center addObserverForName:UIApplicationWillResignActiveNotification object:nil queue:nil usingBlock:awayHandler];
+    [center addObserverForName:UISceneWillDeactivateNotification object:nil queue:nil usingBlock:awayHandler];
     [center addObserverForName:UISceneWillConnectNotification object:nil queue:nil usingBlock:sceneConnectHandler];
     [center addObserverForName:UISceneDidActivateNotification object:nil queue:nil usingBlock:sceneActivateHandler];
 
